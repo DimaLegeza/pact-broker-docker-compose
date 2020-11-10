@@ -1,0 +1,487 @@
+---
+version: '3.3'
+services:
+  rabbitmq:
+    image: teampicnic/picnic-rabbitmq:3.7.8
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+  mongodb:
+    image: mongo:3.6.9
+    ports:
+      - '27017:27017'
+  postgresql:
+    image: mdillon/postgis:9.6-alpine
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./docker/postgres:/docker-entrypoint-initdb.d
+  datalayer:
+    build: docker/datalayer
+    ports:
+      - '8282:8080'
+    volumes:
+      - ./docker/datalayer:/var/www
+  global-id:
+    build: docker/globalid
+    ports:
+      - '9191:8080'
+    volumes:
+      - ./docker/globalid:/var/www
+  keycloak:
+    image: teampicnic/keycloak:3.0.0
+    ports:
+      - '8888:8888'
+      - '9990:9990'
+    environment:
+      KEYCLOAK_USER: admin
+      KEYCLOAK_PASSWORD: admin
+      KEYCLOAK_TEST_REALM: /opt/picnic/realm.json
+      DB_VENDOR: postgres
+      DB_ADDR: postgresql
+      DB_DATABASE: keycloak
+      DB_USER: keycloak
+      DB_PASSWORD: password
+    command: >-
+      -Djboss.http.port=8888
+      -c standalone.xml
+    volumes:
+      - ./docker/keycloak:/opt/picnic
+    depends_on:
+      - postgresql
+  pim-cache-backend:
+    image: teampicnic/picnic-pim-cache:back-0.2.2
+    depends_on:
+     - keycloak
+     - mongodb
+     - rabbitmq
+    volumes:
+     - socket-pim/:/tmp/auth
+     - ./docker/pim-cache/config.json:/run/config/app_config
+  pim-cache-auth:
+    image: teampicnic/picnic-auth-proxy:auth-1.1.0
+    depends_on:
+      - keycloak
+    volumes:
+      - socket-pim/:/tmp/auth
+      - ./docker/pim-cache/auth_config.json:/run/config/auth_config
+  pam-auth:
+    image: teampicnic/picnic-auth-proxy:auth-1.2.0
+    depends_on:
+      - keycloak
+    volumes:
+      - socket-pam/:/tmp/auth
+      - ./docker/pam/auth_config.json:/run/config/auth_config
+  pam:
+    image: teampicnic/picnic-auth-proxy:nginx-1.2.0
+    depends_on:
+      - pam-auth
+      - pam-backend
+    volumes:
+      - socket-pam/:/tmp/auth
+      - ./docker/proxy/upstream.auth:/run/config/upstream.auth
+      - ./docker/proxy/upstream.backend:/run/config/upstream.backend
+  pam-backend:
+    image: teampicnic/picnic-pam:NL-PROD
+    environment:
+      - POSTGRESQL_PASSWORD
+      - S3_ACCESS_KEY
+      - S3_SECRET_KEY
+      - PEE_MARKET=nl
+      - PEE_ENVIRONMENT=dev
+    depends_on:
+      - rabbitmq
+      - postgresql
+    volumes:
+      - socket-pam/:/tmp/auth
+      - ./docker/pam/config-nl-local.yml:/var/www/app/config/config-nl-local.yml
+      - ./docker/pam/config-nl-dev.yml:/var/www/app/config/config-nl-dev.yml
+    ports:
+      - '9194:8080'
+  pim-cache:
+     image: teampicnic/picnic-pim-cache:front-0.2.2
+     ports:
+       - '9797:80'
+     depends_on:
+       - pim-cache-backend
+       - pim-cache-auth
+     volumes:
+       - socket-pim/:/tmp/auth
+       - ./docker/pim-cache/upstream.backend:/run/config/upstream.backend
+       - ./docker/pim-cache/upstream.auth:/run/config/upstream.auth
+  pim-cache-mock:
+    build: docker/pim-cache
+    ports:
+      - '9797:80'
+    volumes:
+      - ./docker/pim-cache:/var/www
+    networks:
+      default:
+        aliases:
+          - pim-cache
+  pom:
+    build: pom/pom-webapp/target
+    image: "teampicnic/picnic-pom:${DOCKER_TAG:-latest}"
+    ports:
+      - '9393:8080'
+      - '19393:19393'
+      - '29393:29393'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx512m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19393,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0,${MARKET:-nl}
+        -Dcom.sun.management.jmxremote.port=29393
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29393
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/pom/app
+    depends_on:
+      - datalayer
+      - global-id
+      - keycloak
+      - mongodb
+      - rabbitmq
+      - pam
+      - pim-cache-mock
+      - stock-service
+      - supplier-stock-service
+      - trade-unit-service
+      - fulfillment
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  pom-dc:
+    build: pom/pom-webapp/target
+    image: "teampicnic/picnic-pom:${DOCKER_TAG:-latest}"
+    ports:
+      - '9898:8080'
+      - '19898:19898'
+      - '29898:29898'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx512m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19898,server=y,suspend=n
+        -Dspring.profiles.active=docker,dc0
+        -Dcom.sun.management.jmxremote.port=29898
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29898
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/pom/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - mongodb
+      - rabbitmq
+      - fulfillment
+      - stock-service-dc
+      - supplier-stock-service-dc
+      - pim-cache-mock
+      - pom
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  pom-admin:
+    build: pom/pom-admin-service/pom-admin-service-web/target
+    image: "teampicnic/picnic-pom-admin:${DOCKER_TAG:-latest}"
+    ports:
+      - '9494:8080'
+      - '19494:19494'
+      - '29494:29494'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx512m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19494,server=y,suspend=n
+        -Dspring.profiles.active=docker
+        -Dcom.sun.management.jmxremote.port=29494
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29494
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/pom-admin/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - pom
+      - pim-cache-mock
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  supplier-edeka:
+    build: pom/supplier-interface-edeka/supplier-interface-edeka-webapp/target
+    image: "teampicnic/picnic-supplier-edeka:${DOCKER_TAG:-latest}"
+    ports:
+      - '9090:8080'
+      - '19090:19090'
+    environment:
+      AWS_REGION: eu-west-1
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19090,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0,de
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/supplier-edeka/app
+    links:
+      - keycloak
+      - mongodb
+      - pom
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  supplier-edeka-proxy:
+    build: pom/supplier-interface-edeka-proxy/supplier-interface-edeka-proxy-webapp/target
+    image: "teampicnic/picnic-supplier-edeka-proxy:${DOCKER_TAG:-latest}"
+    ports:
+      - '9595:8080'
+      - '19595:19595'
+    environment:
+      AWS_REGION: eu-west-1
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19595,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0,de
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/supplier-edeka-proxy/app
+    links:
+      - keycloak
+      - mongodb
+      - pom
+      - supplier-edeka
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  stock-service:
+    image: teampicnic/picnic-stock-service:NL-PROD-FC1
+    ports:
+      - '9696:8080'
+      - '19696:19696'
+      - '29696:29696'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19696,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0
+        -Dcom.sun.management.jmxremote.port=29696
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29696
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/stock-service/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - mongodb
+      - rabbitmq
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  stock-service-dc:
+    image: teampicnic/picnic-stock-service:NL-PROD-DC1
+    ports:
+      - '9999:8080'
+      - '19999:19999'
+      - '29999:29999'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19999,server=y,suspend=n
+        -Dspring.profiles.active=docker,dc0
+        -Dcom.sun.management.jmxremote.port=29999
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29999
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/stock-service/app
+    depends_on:
+      - datalayer
+      - supplier-stock-service-dc
+      - keycloak
+      - mongodb
+      - rabbitmq
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  supplier-stock-auth:
+    image: teampicnic/picnic-auth-proxy:auth-1.2.0
+    depends_on:
+      - keycloak
+    volumes:
+      - socket-sss/:/tmp/auth
+      - ./docker/auth/config.json:/run/config/auth_config
+  supplier-stock-service:
+    image: teampicnic/picnic-auth-proxy:nginx-1.2.0
+    depends_on:
+      - supplier-stock-auth
+      - supplier-stock-service-backend
+    volumes:
+      - socket-sss/:/tmp/auth
+      - ./docker/sss/upstream.auth:/run/config/upstream.auth
+      - ./docker/sss/upstream.backend:/run/config/upstream.backend
+      - ./docker/sss/nginx.conf:/etc/nginx.conf
+  supplier-stock-service-dc:
+    image: teampicnic/picnic-auth-proxy:nginx-1.2.0
+    depends_on:
+      - supplier-stock-auth
+      - supplier-stock-service-dc-backend
+    volumes:
+      - socket-sss/:/tmp/auth
+      - ./docker/sss/upstream.auth:/run/config/upstream.auth
+      - ./docker/sss/upstream.backend.dc:/run/config/upstream.backend
+      - ./docker/sss/nginx.conf:/etc/nginx.conf
+  supplier-stock-service-backend:
+    image: teampicnic/picnic-supplier-stock-service:NL-PROD-FC1
+    ports:
+      - '9292:8080'
+      - '19292:19292'
+      - '29292:29292'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19292,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0,${MARKET:-nl}
+        -Dcom.sun.management.jmxremote.port=29292
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29292
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/supplier-stock-service/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - mongodb
+      - rabbitmq
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  supplier-stock-service-dc-backend:
+    image: teampicnic/picnic-supplier-stock-service:NL-PROD-DC1
+    ports:
+      - '9192:8080'
+      - '19192:19192'
+      - '29192:29192'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19192,server=y,suspend=n
+        -Dspring.profiles.active=docker,dc0,nl
+        -Dcom.sun.management.jmxremote.port=29192
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29192
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/supplier-stock-service/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - mongodb
+      - rabbitmq
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  trade-unit-service:
+    image: teampicnic/picnic-trade-unit-service:NL-PROD-FC1
+    ports:
+      - '9193:8080'
+      - '19193:19193'
+      - '29193:29193'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:19193,server=y,suspend=n
+        -Dspring.profiles.active=docker,fc0,${MARKET:-nl}
+        -Dcom.sun.management.jmxremote.port=29193
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.rmi.port=29193
+        -Djava.rmi.server.hostname=127.0.0.1
+        -Dsupplierstock.base.url=http://supplier-stock-service
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/pom/trade-unit-service/app
+    depends_on:
+      - datalayer
+      - keycloak
+      - mongodb
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  fulfillment:
+    image: teampicnic/picnic-fulfillment:NL-PROD
+    ports:
+      - '8484:8080'
+      - '18484:18484'
+    environment:
+      JAVA_OPTIONS: >-
+        -Xmx256m
+        -Xdebug
+        -agentlib:jdwp=transport=dt_socket,address=*:18484,server=y,suspend=n
+        -Dspring.profiles.active=docker,nl
+        -Djava.rmi.server.hostname=127.0.0.1
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_PATH: /etc/vault/token
+      VAULT_KEY_PATHS: kv/global/local/distribution/fulfillment/app
+    depends_on:
+      - datalayer
+      - rabbitmq
+      - mongodb
+      - keycloak
+      - vault-sync
+    volumes:
+      - ./docker/vault/token:/etc/vault/token
+  vault:
+    image: vault:1.1.2
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - '8200:8200'
+    environment:
+      VAULT_ADDRESS: 127.0.0.1:8200
+      VAULT_DEV_ROOT_TOKEN_ID: test
+      VAULT_LOG_LEVEL: trace
+  vault-sync:
+    image: teampicnic/vault-local-sync:v0.2
+    depends_on:
+      - vault
+    volumes:
+      - ./docker/vault/local-secrets/:/secrets/
+  pact-broker:
+    image: pactfoundation/pact-broker:latest
+    ports:
+      - '8989:9292'
+    depends_on:
+      - postgresql
+    environment:
+      PACT_BROKER_DATABASE_USERNAME: postgres
+      PACT_BROKER_DATABASE_PASSWORD: magic8ball
+      PACT_BROKER_DATABASE_HOST: postgresql
+      PACT_BROKER_DATABASE_NAME: pact_broker
+      PACT_BROKER_LOG_LEVEL: INFO
+volumes:
+  socket-pam:
+  socket-pim:
+  socket-sss:
